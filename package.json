@@ -1,0 +1,19 @@
+{
+  "name": "infocaij-mcp",
+  "version": "0.1.0",
+  "description": "Servidor MCP somente leitura sobre o InfoCAIJ: fila da bancada, gargalos, vendas, estoque e dossiê de máquinas para o Claude.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "infocaij-mcp": "src/server.ts"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.ts",
+    "seed": "node --disable-warning=ExperimentalWarning scripts/seed-demo.ts demo/infocaij-demo.sqlite",
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/*.test.ts\""
+  },
+  "license": "MIT"
+}

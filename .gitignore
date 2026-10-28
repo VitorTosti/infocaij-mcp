@@ -1,0 +1,4 @@
+node_modules/
+demo/*.sqlite
+*.sqlite
+.env
