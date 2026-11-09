@@ -1,4 +1,4 @@
-import { withDb } from './db.ts';
+import { withDb, type Source } from './db.ts';
 import { STATUSES, FINAL_STATUS } from './domain.ts';
 import {
   consultarMaquina,
@@ -11,6 +11,7 @@ import {
   VENDA_REGISTRADA,
   vendas,
   type Clock,
+  type Horas,
 } from './queries.ts';
 
 type JsonSchema = {
@@ -21,7 +22,7 @@ type JsonSchema = {
 };
 
 export interface ToolContext {
-  dbPath: string;
+  source: Source;
   clock: () => Clock;
 }
 
@@ -30,8 +31,35 @@ interface ToolDefinition {
   title: string;
   description: string;
   inputSchema: JsonSchema;
-  run: (args: Record<string, unknown>, ctx: ToolContext) => unknown;
+  /** Forma do resultado (JSON Schema). Vai em outputSchema e descreve o structuredContent. */
+  outputSchema: Record<string, unknown>;
+  run: (args: Record<string, unknown>, ctx: ToolContext) => Promise<unknown>;
 }
+
+// ------------------------------------------------------------ esquemas de saída
+type Schema = Record<string, unknown>;
+const str: Schema = { type: 'string' };
+const num: Schema = { type: 'number' };
+const int: Schema = { type: 'integer' };
+const bool: Schema = { type: 'boolean' };
+const nullable = (s: Schema): Schema => ({ ...s, type: [s.type as string, 'null'] });
+const arr = (items: Schema): Schema => ({ type: 'array', items });
+/** Objeto fechado: todas as propriedades são obrigatórias, menos as listadas em optional. */
+const obj = (properties: Record<string, Schema>, optional: string[] = []): Schema => ({
+  type: 'object',
+  properties,
+  required: Object.keys(properties).filter((k) => !optional.includes(k)),
+  additionalProperties: false,
+});
+const HORAS_OUT: Record<string, Schema> = { horas: { type: 'string', enum: ['corridas', 'uteis'] }, horario_util: str };
+const HORAS_IN = {
+  type: 'string',
+  enum: ['corridas', 'uteis'],
+  default: 'corridas',
+  description:
+    '"corridas" (padrão) conta o relógio todo; "uteis" desconta noites e fins de semana (expediente configurado no servidor). ' +
+    'Prefira "uteis" para julgar se algo está atrasado de verdade.',
+};
 
 const OPEN_STATUSES = STATUSES.filter((s) => s !== FINAL_STATUS);
 
@@ -46,7 +74,13 @@ export const TOOLS: ToolDefinition[] = [
       'quantas são prioritárias, há quanto tempo está a mais antiga de cada etapa e quantas foram entregues nos últimos 7 dias. ' +
       'Use primeiro para perguntas gerais como "como está a bancada?" ou "quanto falta entregar?".',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-    run: (_args, ctx) => withDb(ctx.dbPath, (db) => resumoFila(db, ctx.clock())),
+    outputSchema: obj({
+      gerado_em: str,
+      maquinas_em_aberto: int,
+      entregues_ultimos_7_dias: int,
+      etapas: arr(obj({ etapa: str, maquinas: int, prioritarias: int, mais_antiga_horas: nullable(num) })),
+    }),
+    run: (_args, ctx) => withDb(ctx.source, (db) => resumoFila(db, ctx.clock())),
   },
   {
     name: 'itens_parados',
@@ -61,15 +95,31 @@ export const TOOLS: ToolDefinition[] = [
         etapa: { type: 'string', enum: OPEN_STATUSES, description: 'Filtra por uma etapa. Omita para todas.' },
         horas_minimas: { type: 'number', minimum: 0, maximum: 2000, default: 48, description: 'Tempo mínimo na etapa, em horas (padrão 48).' },
         limite: { type: 'integer', minimum: 1, maximum: 100, default: 20, description: 'Máximo de máquinas listadas (padrão 20).' },
+        horas: HORAS_IN,
       },
       additionalProperties: false,
     },
+    outputSchema: obj(
+      {
+        criterio: str,
+        ...HORAS_OUT,
+        total: int,
+        itens: arr(
+          obj({
+            codigo: str, produto: str, etapa: str, horas_na_etapa: num, desde: str,
+            tecnico: nullable(str), plataforma: str, empresa: str, prioridade: bool,
+          }),
+        ),
+      },
+      ['horario_util'],
+    ),
     run: (args, ctx) =>
-      withDb(ctx.dbPath, (db) =>
+      withDb(ctx.source, (db) =>
         itensParados(db, ctx.clock(), {
           etapa: args.etapa as (typeof OPEN_STATUSES)[number] | undefined,
           horas_minimas: args.horas_minimas as number,
           limite: args.limite as number,
+          horas: args.horas as Horas,
         }),
       ),
   },
@@ -85,10 +135,25 @@ export const TOOLS: ToolDefinition[] = [
       type: 'object',
       properties: {
         dias: { type: 'integer', minimum: 1, maximum: 365, default: 30, description: 'Janela analisada em dias (padrão 30).' },
+        horas: HORAS_IN,
       },
       additionalProperties: false,
     },
-    run: (args, ctx) => withDb(ctx.dbPath, (db) => tempoPorEtapa(db, ctx.clock(), { dias: args.dias as number })),
+    outputSchema: obj(
+      {
+        periodo_dias: int,
+        ...HORAS_OUT,
+        observacao: str,
+        gargalo: nullable(str),
+        etapas_sem_uso: arr(str),
+        venda_ate_entrega: obj({ maquinas: int, mediana_horas: num, p90_horas: num }),
+        etapas: arr(
+          obj({ etapa: str, passagens: int, mediana_horas: num, p90_horas: num, horas_totais: int, participacao_pct: int }),
+        ),
+      },
+      ['horario_util'],
+    ),
+    run: (args, ctx) => withDb(ctx.source, (db) => tempoPorEtapa(db, ctx.clock(), { dias: args.dias as number, horas: args.horas as Horas })),
   },
   {
     name: 'tempo_entre_etapas',
@@ -111,17 +176,36 @@ export const TOOLS: ToolDefinition[] = [
         ate: { type: 'string', enum: STATUSES.filter((s) => s !== 'Pendente'), description: 'Etapa de destino, por exemplo "Pronta".' },
         dias: { type: 'integer', minimum: 1, maximum: 365, default: 30, description: 'Considera máquinas que chegaram ao destino nos últimos N dias (padrão 30).' },
         agrupar_por: { type: 'string', enum: ['tecnico', 'plataforma', 'empresa'], description: 'Quebra o resultado por técnico, plataforma ou empresa. Omita para o total.' },
+        horas: HORAS_IN,
       },
       required: ['ate'],
       additionalProperties: false,
     },
+    outputSchema: obj(
+      {
+        de: str,
+        ate: str,
+        periodo_dias: int,
+        ...HORAS_OUT,
+        observacao: str,
+        maquinas: int,
+        media_horas: num,
+        mediana_horas: num,
+        p90_horas: num,
+        chegaram_pulando_a_etapa: int,
+        ainda_nao_chegaram: int,
+        por_grupo: arr(obj({ grupo: str, maquinas: int, media_horas: num, mediana_horas: num, p90_horas: num })),
+      },
+      ['horario_util', 'por_grupo'],
+    ),
     run: (args, ctx) =>
-      withDb(ctx.dbPath, (db) =>
+      withDb(ctx.source, (db) =>
         tempoEntreEtapas(db, ctx.clock(), {
           de: args.de as string,
           ate: args.ate as (typeof STATUSES)[number],
           dias: args.dias as number,
           agrupar_por: args.agrupar_por as 'tecnico' | undefined,
+          horas: args.horas as Horas,
         }),
       ),
   },
@@ -139,7 +223,12 @@ export const TOOLS: ToolDefinition[] = [
       },
       additionalProperties: false,
     },
-    run: (args, ctx) => withDb(ctx.dbPath, (db) => produtividade(db, ctx.clock(), { dias: args.dias as number })),
+    outputSchema: obj({
+      periodo_dias: int,
+      por_tecnico: arr(obj({ tecnico: str, prontas: int, entregues: int })),
+      prontas_por_dia: arr(obj({ dia: str, prontas: int })),
+    }),
+    run: (args, ctx) => withDb(ctx.source, (db) => produtividade(db, ctx.clock(), { dias: args.dias as number })),
   },
   {
     name: 'vendas',
@@ -162,8 +251,20 @@ export const TOOLS: ToolDefinition[] = [
       },
       additionalProperties: false,
     },
+    outputSchema: obj({
+      periodo_dias: int,
+      total_pedidos: int,
+      total_maquinas: int,
+      // Cada grupo tem também uma chave com o nome do agrupamento (plataforma, empresa, vendedor ou dia).
+      grupos: arr({
+        type: 'object',
+        properties: { pedidos: int, maquinas: int, canceladas: int, devolvidas: int },
+        required: ['pedidos', 'maquinas', 'canceladas', 'devolvidas'],
+        additionalProperties: true,
+      }),
+    }),
     run: (args, ctx) =>
-      withDb(ctx.dbPath, (db) =>
+      withDb(ctx.source, (db) =>
         vendas(db, ctx.clock(), { dias: args.dias as number, agrupar_por: args.agrupar_por as 'plataforma' }),
       ),
   },
@@ -180,7 +281,12 @@ export const TOOLS: ToolDefinition[] = [
       },
       additionalProperties: false,
     },
-    run: (args, ctx) => withDb(ctx.dbPath, (db) => estoque(db, { loja: args.loja as string | undefined })),
+    outputSchema: obj({
+      loja: str,
+      por_status: arr(obj({ loja: str, status: str, unidades: int })),
+      modelos_disponiveis: arr(obj({ modelo: str, prontas: int, em_preparo: int })),
+    }),
+    run: (args, ctx) => withDb(ctx.source, (db) => estoque(db, { loja: args.loja as string | undefined })),
   },
   {
     name: 'consultar_maquina',
@@ -197,16 +303,41 @@ export const TOOLS: ToolDefinition[] = [
       required: ['busca'],
       additionalProperties: false,
     },
-    run: (args, ctx) => withDb(ctx.dbPath, (db) => consultarMaquina(db, ctx.clock(), { busca: args.busca as string })),
+    outputSchema: obj(
+      {
+        busca: str,
+        encontrado: bool,
+        dica: str,
+        estoque: nullable({ type: 'object' }),
+        vendas: arr(
+          obj({
+            codigo: str, produto: str, etapa: str, situacao_comercial: str,
+            serial: nullable(str), os: nullable(str), tecnico: nullable(str),
+            venda: obj({ data: str, plataforma: str, empresa: str, vendedor: nullable(str), referencia_pedido: nullable(str), prioridade: bool }),
+            nota_fiscal: nullable(str),
+            retirada: nullable({ type: 'object' }),
+            embalagem: nullable({ type: 'object' }),
+            checklist: obj({ aprovados: int, reprovados: arr(str), nao_testados: int }),
+            garantia: nullable({ type: 'object' }),
+            eventos_comerciais: arr({ type: 'object' }),
+            historico: arr(obj({ em: str, evento: str })),
+          }),
+        ),
+      },
+      ['dica', 'estoque', 'vendas'],
+    ),
+    run: (args, ctx) => withDb(ctx.source, (db) => consultarMaquina(db, ctx.clock(), { busca: args.busca as string })),
   },
 ];
 
-export function listTools() {
-  return TOOLS.map(({ name, title, description, inputSchema }) => ({
+/** outputSchema só existe a partir do protocolo 2025-06-18; clientes antigos não o recebem. */
+export function listTools(withOutputSchema = true) {
+  return TOOLS.map(({ name, title, description, inputSchema, outputSchema }) => ({
     name,
     title,
     description,
     inputSchema,
+    ...(withOutputSchema ? { outputSchema } : {}),
     annotations: { title, ...READ_ONLY },
   }));
 }

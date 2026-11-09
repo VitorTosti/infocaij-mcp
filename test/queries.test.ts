@@ -34,7 +34,7 @@ function scenario() {
   });
 }
 
-test('parseStatusChange entende a frase gravada pelo InfoCAIJ, inclusive com barra', () => {
+test('parseStatusChange entende a frase gravada pelo InfoCAIJ, inclusive com barra', async () => {
   assert.deepEqual(parseStatusChange('Status alterado de Aguardando embalagem para Entregue/Enviada.'), {
     from: 'Aguardando embalagem',
     to: 'Entregue/Enviada',
@@ -43,9 +43,9 @@ test('parseStatusChange entende a frase gravada pelo InfoCAIJ, inclusive com bar
   assert.equal(parseStatusChange('Checklist tecnico atualizado.'), null);
 });
 
-test('resumo_fila conta por etapa, ignora cancelados e mede a mais antiga', () => {
+test('resumo_fila conta por etapa, ignora cancelados e mede a mais antiga', async () => {
   const handle = handlerFor(scenario(), NOW);
-  const result = call(handle, 'resumo_fila').json();
+  const result = (await call(handle, 'resumo_fila')).json();
   const byStage = Object.fromEntries(result.etapas.map((e: any) => [e.etapa, e]));
   assert.equal(result.maquinas_em_aberto, 2);
   assert.equal(byStage['Aguardando teste'].maquinas, 1);
@@ -55,20 +55,20 @@ test('resumo_fila conta por etapa, ignora cancelados e mede a mais antiga', () =
   assert.equal(byStage['Pendente'].maquinas, 0, 'o item cancelado não entra na fila');
 });
 
-test('itens_parados mede o tempo desde a última mudança de etapa', () => {
+test('itens_parados mede o tempo desde a última mudança de etapa', async () => {
   const handle = handlerFor(scenario(), NOW);
-  const result = call(handle, 'itens_parados', { horas_minimas: 24 }).json();
+  const result = (await call(handle, 'itens_parados', { horas_minimas: 24 })).json();
   assert.equal(result.total, 1);
   assert.equal(result.itens[0].codigo, 'CAIJ-0001');
   assert.equal(result.itens[0].horas_na_etapa, 70);
 
-  const filtered = call(handle, 'itens_parados', { etapa: 'Em preparacao', horas_minimas: 0 }).json();
+  const filtered = (await call(handle, 'itens_parados', { etapa: 'Em preparacao', horas_minimas: 0 })).json();
   assert.deepEqual(filtered.itens.map((i: any) => i.codigo), ['CAIJ-0002']);
 });
 
-test('tempo_por_etapa calcula a duração de cada passagem concluída', () => {
+test('tempo_por_etapa calcula a duração de cada passagem concluída', async () => {
   const handle = handlerFor(scenario(), NOW);
-  const result = call(handle, 'tempo_por_etapa', { dias: 30 }).json();
+  const result = (await call(handle, 'tempo_por_etapa', { dias: 30 })).json();
   const byStage = Object.fromEntries(result.etapas.map((e: any) => [e.etapa, e]));
   // Pendente: A ficou 10 h, B ficou 30 h → mediana 20 h.
   assert.equal(byStage['Pendente'].passagens, 2);
@@ -81,7 +81,7 @@ test('tempo_por_etapa calcula a duração de cada passagem concluída', () => {
   assert.ok(result.etapas_sem_uso.includes('Pronta'));
 });
 
-test('gargalo é a etapa com mais horas somadas, mesmo com mediana baixa (cauda longa)', () => {
+test('gargalo é a etapa com mais horas somadas, mesmo com mediana baixa (cauda longa)', async () => {
   // Etapa "Aguardando retirada": 9 máquinas passam em 1 h, 1 fica 100 h → mediana 1 h, total 109 h.
   // Etapa "Pendente": 10 máquinas passam em 5 h → mediana 5 h, total 50 h.
   const db = tinyDb((d) => {
@@ -96,7 +96,7 @@ test('gargalo é a etapa com mais horas somadas, mesmo com mediana baixa (cauda 
               (${i}, 'updated', 'Status alterado de Aguardando retirada para Aguardando nota fiscal.', '${at(start - 5 - retiradaHours)}');`);
     }
   });
-  const result = call(handlerFor(db, NOW), 'tempo_por_etapa', { dias: 30 }).json();
+  const result = (await call(handlerFor(db, NOW), 'tempo_por_etapa', { dias: 30 })).json();
   const byStage = Object.fromEntries(result.etapas.map((e: any) => [e.etapa, e]));
   assert.equal(byStage['Aguardando retirada'].mediana_horas, 1);
   assert.equal(byStage['Pendente'].mediana_horas, 5);
@@ -104,31 +104,31 @@ test('gargalo é a etapa com mais horas somadas, mesmo com mediana baixa (cauda 
   assert.ok(result.etapas_sem_uso.includes('Em preparacao'));
 });
 
-test('consultar_maquina encontra por serial, código e ignora maiúsculas', () => {
+test('consultar_maquina encontra por serial, código e ignora maiúsculas', async () => {
   const handle = handlerFor(scenario(), NOW);
   for (const busca of ['serial-a', 'CAIJ-0001', '  SERIAL-A ']) {
-    const result = call(handle, 'consultar_maquina', { busca }).json();
+    const result = (await call(handle, 'consultar_maquina', { busca })).json();
     assert.equal(result.encontrado, true, busca);
     assert.equal(result.vendas[0].codigo, 'CAIJ-0001');
   }
-  const history = call(handle, 'consultar_maquina', { busca: 'CAIJ-0001' }).json().vendas[0].historico;
+  const history = (await call(handle, 'consultar_maquina', { busca: 'CAIJ-0001' })).json().vendas[0].historico;
   assert.equal(history.length, 4);
   assert.match(history[0].evento, /Item criado/);
 
-  const none = call(handle, 'consultar_maquina', { busca: 'NAO-EXISTE' }).json();
+  const none = (await call(handle, 'consultar_maquina', { busca: 'NAO-EXISTE' })).json();
   assert.equal(none.encontrado, false);
 });
 
-test('vendas agrupa por plataforma e conta cancelamentos', () => {
+test('vendas agrupa por plataforma e conta cancelamentos', async () => {
   const handle = handlerFor(scenario(), NOW);
-  const result = call(handle, 'vendas', { dias: 30, agrupar_por: 'plataforma' }).json();
+  const result = (await call(handle, 'vendas', { dias: 30, agrupar_por: 'plataforma' })).json();
   const shopee = result.grupos.find((g: any) => g.plataforma === 'Shopee');
   assert.equal(shopee.pedidos, 2);
   assert.equal(shopee.canceladas, 1);
   assert.equal(result.total_maquinas, 3);
 });
 
-test('tempo_entre_etapas mede da venda registrada até Pronta e conta quem pulou etapa', () => {
+test('tempo_entre_etapas mede da venda registrada até Pronta e conta quem pulou etapa', async () => {
   // A: criada há 100 h, chegou a "Aguardando teste" há 70 h (ainda não está pronta).
   // C: criada há 60 h, foi direto de Pendente para Aguardando retirada há 40 h (pulou Pronta) → 20 h.
   // D: criada há 30 h, Pronta há 20 h → 10 h.
@@ -146,16 +146,16 @@ test('tempo_entre_etapas mede da venda registrada até Pronta e conta quem pulou
     `);
   });
   const handle = handlerFor(db, NOW);
-  const result = call(handle, 'tempo_entre_etapas', { ate: 'Pronta' }).json();
+  const result = (await call(handle, 'tempo_entre_etapas', { ate: 'Pronta' })).json();
   assert.equal(result.de, 'Venda registrada');
   assert.equal(result.maquinas, 2);
   assert.equal(result.media_horas, 15);
   assert.equal(result.chegaram_pulando_a_etapa, 1);
   assert.equal(result.ainda_nao_chegaram, 1);
 
-  const byTech = call(handle, 'tempo_entre_etapas', { ate: 'Pronta', agrupar_por: 'tecnico' }).json();
+  const byTech = (await call(handle, 'tempo_entre_etapas', { ate: 'Pronta', agrupar_por: 'tecnico' })).json();
   assert.deepEqual(byTech.por_grupo.map((g: any) => [g.grupo, g.mediana_horas]).sort(), [['Ana', 10], ['Bruno', 20]]);
 
-  const backwards = call(handle, 'tempo_entre_etapas', { de: 'Pronta', ate: 'Aguardando teste' });
+  const backwards = (await call(handle, 'tempo_entre_etapas', { de: 'Pronta', ate: 'Aguardando teste' }));
   assert.equal(backwards.isError, true);
 });

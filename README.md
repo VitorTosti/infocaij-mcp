@@ -39,13 +39,21 @@ E três **prompts** prontos, que o usuário escolhe no menu do Claude:
 | `diagnostico_gargalo` | Investigação de uma etapa: tempos, máquinas presas e o padrão no histórico das mais antigas, com a hipótese marcada como hipótese |
 | `status_pedido` | Resposta para o vendedor, em até 3 frases, no tom de uma mensagem de WhatsApp |
 
+### Horas corridas ou úteis
+
+`itens_parados`, `tempo_por_etapa` e `tempo_entre_etapas` aceitam `horas: "uteis"`. Uma máquina que entra em "Aguardando nota fiscal" na sexta às 17h e continua lá na segunda às 11h está há **66 h corridas**, mas só **4 h úteis**. O padrão é segunda a sexta, 08:00 às 18:00, fuso de Brasília, sem feriados; dá para mudar com `INFOCAIJ_HORARIO_UTIL`, `INFOCAIJ_DIAS_UTEIS` e `INFOCAIJ_FUSO` (ver [Configuração](#configuração)). O resultado informa em `horas` qual medida foi usada e, em horas úteis, o expediente aplicado.
+
+### Saída estruturada
+
+Toda ferramenta devolve o resultado em dois formatos: o texto JSON de sempre e o `structuredContent`, descrito por um `outputSchema`. O cliente pode validar o resultado e o modelo recebe campos tipados. Clientes do protocolo anterior a `2025-06-18` continuam recebendo só o texto. Um teste confere, para cada ferramenta, que o resultado real cumpre o esquema anunciado.
+
 ## Como funciona
 
 ```mermaid
 flowchart LR
     U(["Gestão e vendedores"]) -- "pergunta em português" --> C["Claude<br/>(Desktop, Code ou outro cliente MCP)"]
     C -- "JSON-RPC por stdio" --> S["infocaij-mcp<br/>8 ferramentas · 3 prompts"]
-    S -- "somente leitura" --> DB[("Banco do InfoCAIJ<br/>SQLite")]
+    S -- "somente leitura" --> DB[("Banco do InfoCAIJ<br/>SQLite ou PostgreSQL")]
     APP["InfoCAIJ<br/>(app web)"] -- "grava" --> DB
 ```
 
@@ -65,7 +73,7 @@ O ponto central é o **`tempo_por_etapa`**. O InfoCAIJ não guarda quanto tempo 
 
 ## Avaliado com o modelo, não só com testes
 
-Além dos 20 testes automatizados, o servidor foi conectado ao Claude Code e testado com perguntas reais. Uma das sessões mostrou um problema que nenhum teste unitário pegaria:
+Além dos 56 testes automatizados, o servidor foi conectado ao Claude Code e testado com perguntas reais. Uma das sessões mostrou um problema que nenhum teste unitário pegaria:
 
 | | |
 |:--|:--|
@@ -91,7 +99,7 @@ Requer **Node.js 22.18 ou superior** (roda TypeScript direto, sem build). Nada p
 ```bash
 git clone https://github.com/VitorTosti/infocaij-mcp.git
 cd infocaij-mcp
-npm test          # 20 testes
+npm test          # 56 testes
 npm run seed      # cria demo/infocaij-demo.sqlite com dados fictícios
 ```
 
@@ -118,6 +126,19 @@ Em `claude_desktop_config.json` (no Windows, `%APPDATA%\Claude\claude_desktop_co
   }
 }
 ```
+
+### PostgreSQL
+
+O InfoCAIJ em produção usa PostgreSQL. Instale o driver (é opcional, o servidor continua sem dependências para quem usa SQLite) e use `INFOCAIJ_DATABASE_URL` no lugar de `INFOCAIJ_DB_PATH`:
+
+```bash
+npm install pg
+claude mcp add infocaij \
+  -e INFOCAIJ_DATABASE_URL=postgres://leitura:senha@servidor:5432/infocaij \
+  -- node --disable-warning=ExperimentalWarning /caminho/para/infocaij-mcp/src/server.ts
+```
+
+A sessão abre com `default_transaction_read_only=on` e `statement_timeout`, e o adaptador só aceita `SELECT`. **Crie também um papel do banco só com `SELECT`** nas tabelas usadas (`sales`, `sale_items`, `item_history`, `stock_units`, `stock_lots`, `product_suggestions`, `machine_lifecycle_events` e `warranties`), para a trava existir também do lado do banco. Dê `SELECT` apenas nas colunas que o servidor consulta, se quiser excluir de vez os dados pessoais das garantias.
 
 ### Banco em servidor remoto
 
@@ -146,27 +167,51 @@ claude mcp add infocaij-demo \
 
 O banco de demonstração simula 45 dias de operação (cerca de 480 máquinas e 4.600 eventos) com o mesmo esquema do InfoCAIJ. Todos os nomes são inventados.
 
+## Configuração
+
+| Variável | Para quê | Padrão |
+|:--|:--|:--|
+| `INFOCAIJ_DB_PATH` | Arquivo SQLite do InfoCAIJ | (use esta **ou** a URL) |
+| `INFOCAIJ_DATABASE_URL` | URL do PostgreSQL do InfoCAIJ (exige `npm install pg`) | |
+| `INFOCAIJ_MCP_TIMEOUT_MS` | Tempo máximo de uma consulta | `30000` |
+| `INFOCAIJ_HORARIO_UTIL` | Expediente para horas úteis | `08:00-18:00` |
+| `INFOCAIJ_DIAS_UTEIS` | Dias úteis (1 = segunda, 7 = domingo) | `1-5` |
+| `INFOCAIJ_FUSO` | Fuso do expediente | `-03:00` |
+| `INFOCAIJ_MCP_NOW` | Data e hora fixas, para demonstrações e testes | agora |
+
+## Robustez
+
+- **Tempo limite**: uma consulta que passa do limite volta como erro para o modelo (que pode tentar um período menor), e a conexão é fechada quando ela termina.
+- **Tamanho**: uma resposta maior que 200 mil caracteres é recusada com orientação, em vez de estourar o contexto do modelo.
+- **Concorrência e cancelamento**: os pedidos rodam em paralelo, então uma consulta lenta não trava um `ping`. Um `notifications/cancelled` do cliente descarta a resposta.
+- **Encerramento**: ao fechar a entrada, o servidor termina o que está em andamento antes de sair.
+- **Entrada**: uma linha maior que 1 MB é recusada sem derrubar o servidor, e uma configuração inválida impede a partida com uma mensagem clara.
+- **Ordem determinística**: toda consulta com empate tem desempate explícito, para SQLite e PostgreSQL darem o mesmo resultado.
+
 ## Estrutura
 
 ```text
 src/
-  server.ts     transporte stdio
-  protocol.ts   MCP: initialize, tools/*, prompts/*, erros JSON-RPC
-  tools.ts      definição, descrição e validação das 8 ferramentas
+  server.ts     transporte stdio, configuração e encerramento
+  protocol.ts   MCP: initialize, tools/*, prompts/*, tempo limite, cancelamento, erros JSON-RPC
+  tools.ts      definição, descrição, validação e esquema de saída das 8 ferramentas
   queries.ts    consultas e reconstrução da linha do tempo por máquina
+  horario.ts    horas úteis e leitura do expediente
   prompts.ts    os 3 prompts prontos
-  db.ts         abertura somente leitura
+  db.ts         acesso somente leitura (SQLite) e a interface comum
+  postgres.ts   adaptador PostgreSQL (driver pg opcional)
   domain.ts     etapas e vocabulário do InfoCAIJ
 scripts/seed-demo.ts   banco de demonstração com o mesmo esquema
-test/                  protocolo, cálculos com valores conhecidos, segurança e privacidade
+test/                  protocolo, cálculos com valores conhecidos, segurança e privacidade,
+                       saída estruturada, horas úteis, PostgreSQL (driver falso) e robustez
 docs/demonstracao.md   sessões reais com o Claude
 ```
 
 ## Limitações
 
-- Tempos em horas corridas, não horas úteis.
-- O técnico de `produtividade` é o responsável atual da máquina, não necessariamente quem a moveu de etapa.
-- Lê o banco SQLite. O InfoCAIJ também suporta PostgreSQL; um adaptador é o próximo passo.
+- Horas úteis não descontam feriados.
+- O técnico de `produtividade` é o responsável atual da máquina, não necessariamente quem a moveu de etapa. O `item_history` do InfoCAIJ não grava quem fez cada mudança de status, então atribuir pelo evento exigiria o sistema registrar o autor.
+- O adaptador PostgreSQL foi validado contra um PostgreSQL em memória (`pg-mem`) com o mesmo esquema do InfoCAIJ e contra um driver falso nos testes, mas ainda não contra o banco de produção. Rode primeiro contra uma cópia.
 
 ## Autoria
 

@@ -15,7 +15,7 @@ const SAMPLE_ARGS: Record<string, Record<string, unknown>> = {
 };
 const hash = () => crypto.createHash('sha256').update(fs.readFileSync(dbPath)).digest('hex');
 
-test('o driver recusa qualquer escrita', () => {
+test('o driver recusa qualquer escrita', async () => {
   const db = openReadOnly(dbPath);
   try {
     assert.throws(() => db.exec('DELETE FROM sales'), /readonly|read-only|query_only/i);
@@ -26,15 +26,15 @@ test('o driver recusa qualquer escrita', () => {
   }
 });
 
-test('rodar todas as ferramentas não altera um byte do banco', () => {
+test('rodar todas as ferramentas não altera um byte do banco', async () => {
   const before = hash();
   for (const tool of TOOLS) {
-    assert.equal(call(handle, tool.name, SAMPLE_ARGS[tool.name] ?? {}).isError, false, tool.name);
+    assert.equal((await call(handle, tool.name, SAMPLE_ARGS[tool.name] ?? {})).isError, false, tool.name);
   }
   assert.equal(hash(), before);
 });
 
-test('nenhuma ferramenta devolve dados pessoais de clientes', () => {
+test('nenhuma ferramenta devolve dados pessoais de clientes', async () => {
   // O banco de demonstração tem nome, e-mail, telefone e documento falsos em garantias e clientes.
   const db = new DatabaseSync(dbPath, { readOnly: true });
   const serials = (db.prepare(`SELECT serial FROM warranties`).all() as Array<{ serial: string }>).map((r) => r.serial);
@@ -42,19 +42,19 @@ test('nenhuma ferramenta devolve dados pessoais de clientes', () => {
   assert.ok(serials.length > 50, 'o banco de demonstração precisa ter garantias com dados pessoais falsos');
 
   const outputs = [
-    ...TOOLS.filter((t) => t.name !== 'consultar_maquina').map((t) => call(handle, t.name, SAMPLE_ARGS[t.name] ?? {}).text),
-    ...serials.map((busca) => call(handle, 'consultar_maquina', { busca }).text),
+    ...(await Promise.all(TOOLS.filter((t) => t.name !== 'consultar_maquina').map(async (t) => (await call(handle, t.name, SAMPLE_ARGS[t.name] ?? {})).text))),
+    ...(await Promise.all(serials.map(async (busca) => (await call(handle, 'consultar_maquina', { busca })).text))),
   ];
   const leaks = /Cliente Ficticio|@exemplo\.invalid|\+55 11 90000|000\.000\.\d{3}-00/;
   for (const text of outputs) assert.doesNotMatch(text, leaks);
 
   // E a garantia aparece, só que sem os dados do cliente.
-  const sample = JSON.parse(call(handle, 'consultar_maquina', { busca: serials[0] }).text);
+  const sample = JSON.parse((await call(handle, 'consultar_maquina', { busca: serials[0] })).text);
   assert.ok(sample.vendas[0].garantia, 'a situação da garantia deve aparecer');
   assert.deepEqual(Object.keys(sample.vendas[0].garantia).sort(), ['compra', 'expira_em', 'meses', 'situacao']);
 });
 
-test('não existe ferramenta de SQL livre', () => {
+test('não existe ferramenta de SQL livre', async () => {
   for (const tool of TOOLS) {
     for (const [name, spec] of Object.entries(tool.inputSchema.properties)) {
       assert.doesNotMatch(name, /sql|query|consulta_livre/i, `${tool.name}.${name}`);

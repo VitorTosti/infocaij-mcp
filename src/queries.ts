@@ -1,4 +1,5 @@
 import { all, get, type Db, type Row } from './db.ts';
+import { DEFAULT_SCHEDULE, businessHoursBetween, describeSchedule, type Schedule } from './horario.ts';
 import { CHECKLIST_LABELS, FINAL_STATUS, STATUSES, parseStatusChange, type Status } from './domain.ts';
 
 /**
@@ -13,6 +14,21 @@ const HOUR = 3_600_000;
 
 export interface Clock {
   now: Date;
+  /** Expediente usado quando a consulta pede horas úteis. */
+  schedule?: Schedule;
+}
+
+export type Horas = 'corridas' | 'uteis';
+
+/** Tempo entre dois instantes, em horas corridas ou úteis. */
+function span(fromMs: number, toMs: number, clock: Clock, modo: Horas): number {
+  return modo === 'uteis' ? businessHoursBetween(fromMs, toMs, clock.schedule ?? DEFAULT_SCHEDULE) : (toMs - fromMs) / HOUR;
+}
+
+function modoInfo(clock: Clock, modo: Horas) {
+  return modo === 'uteis'
+    ? { horas: modo, horario_util: describeSchedule(clock.schedule ?? DEFAULT_SCHEDULE) }
+    : { horas: modo };
 }
 
 // ---------------------------------------------------------------- utilidades
@@ -64,15 +80,16 @@ interface Timeline {
  * histórico ("Status alterado de X para Y."). A primeira etapa começa na
  * criação do item.
  */
-function loadTimelines(db: Db, onlyActive: boolean): Timeline[] {
-  const items = all(
+async function loadTimelines(db: Db, onlyActive: boolean): Promise<Timeline[]> {
+  const items = await all(
     db,
     `SELECT i.id, i.internal_code, i.product_name, i.status, i.technician, i.created_at,
             s.platform, s.company, s.is_priority
        FROM sale_items i JOIN sales s ON s.id = i.sale_id
-      ${onlyActive ? `WHERE ${ACTIVE}` : ''}`,
+      ${onlyActive ? `WHERE ${ACTIVE}` : ''}
+      ORDER BY i.id`,
   );
-  const history = all(
+  const history = await all(
     db,
     `SELECT item_id, description, created_at FROM item_history
       WHERE description LIKE 'Status alterado de %'
@@ -119,8 +136,8 @@ function currentStay(timeline: Timeline): Stay {
 
 // ------------------------------------------------------------------- ferramentas
 
-export function resumoFila(db: Db, clock: Clock) {
-  const open = loadTimelines(db, true).filter((t) => t.status !== FINAL_STATUS);
+export async function resumoFila(db: Db, clock: Clock) {
+  const open = (await loadTimelines(db, true)).filter((t) => t.status !== FINAL_STATUS);
 
   const etapas = STATUSES.filter((s) => s !== FINAL_STATUS).map((status) => {
     const here = open.filter((t) => t.status === status);
@@ -134,7 +151,7 @@ export function resumoFila(db: Db, clock: Clock) {
   });
 
   const since = daysAgo(clock, 7).toISOString();
-  const delivered = get(
+  const delivered = await get(
     db,
     `SELECT COUNT(DISTINCT h.item_id) AS n FROM item_history h JOIN sale_items i ON i.id = h.item_id
       WHERE h.description LIKE '%para Entregue/Enviada.' AND h.created_at >= $since AND ${ACTIVE}`,
@@ -149,20 +166,22 @@ export function resumoFila(db: Db, clock: Clock) {
   };
 }
 
-export function itensParados(
+export async function itensParados(
   db: Db,
   clock: Clock,
-  args: { etapa?: Status; horas_minimas: number; limite: number },
+  args: { etapa?: Status; horas_minimas: number; limite: number; horas?: Horas },
 ) {
-  const stuck = loadTimelines(db, true)
+  const modo = args.horas ?? 'corridas';
+  const stuck = (await loadTimelines(db, true))
     .filter((t) => t.status !== FINAL_STATUS)
     .filter((t) => !args.etapa || t.status === args.etapa)
-    .map((t) => ({ t, hours: hoursBetween(currentStay(t).enteredAt, clock.now) }))
+    .map((t) => ({ t, hours: span(Date.parse(currentStay(t).enteredAt), clock.now.getTime(), clock, modo) }))
     .filter(({ hours }) => hours >= args.horas_minimas)
     .sort((a, b) => b.hours - a.hours);
 
   return {
-    criterio: `${args.etapa ?? 'qualquer etapa'} há pelo menos ${args.horas_minimas} h`,
+    criterio: `${args.etapa ?? 'qualquer etapa'} há pelo menos ${args.horas_minimas} h${modo === 'uteis' ? ' úteis' : ''}`,
+    ...modoInfo(clock, modo),
     total: stuck.length,
     itens: stuck.slice(0, args.limite).map(({ t, hours }) => ({
       codigo: t.internalCode,
@@ -178,15 +197,16 @@ export function itensParados(
   };
 }
 
-export function tempoPorEtapa(db: Db, clock: Clock, args: { dias: number }) {
+export async function tempoPorEtapa(db: Db, clock: Clock, args: { dias: number; horas?: Horas }) {
+  const modo = args.horas ?? 'corridas';
   const since = daysAgo(clock, args.dias).getTime();
-  const timelines = loadTimelines(db, true);
+  const timelines = await loadTimelines(db, true);
 
   const etapas = STATUSES.filter((s) => s !== FINAL_STATUS).map((status) => {
     const durations = timelines
       .flatMap((t) => t.stays)
       .filter((stay) => stay.status === status && stay.leftAt && Date.parse(stay.leftAt) >= since)
-      .map((stay) => (Date.parse(stay.leftAt as string) - Date.parse(stay.enteredAt)) / HOUR)
+      .map((stay) => span(Date.parse(stay.enteredAt), Date.parse(stay.leftAt as string), clock, modo))
       .sort((a, b) => a - b);
     return {
       etapa: status,
@@ -209,13 +229,15 @@ export function tempoPorEtapa(db: Db, clock: Clock, args: { dias: number }) {
     .filter((t) => t.status === FINAL_STATUS)
     .map((t) => ({ start: t.stays[0].enteredAt, end: currentStay(t).enteredAt }))
     .filter(({ end }) => Date.parse(end) >= since)
-    .map(({ start, end }) => (Date.parse(end) - Date.parse(start)) / HOUR)
+    .map(({ start, end }) => span(Date.parse(start), Date.parse(end), clock, modo))
     .sort((a, b) => a - b);
 
   return {
     periodo_dias: args.dias,
+    ...modoInfo(clock, modo),
     observacao:
-      'Horas corridas, não horas úteis. Considera só passagens concluídas no período. ' +
+      (modo === 'uteis' ? 'Horas úteis (fora do expediente não conta). ' : 'Horas corridas, não horas úteis. ') +
+      'Considera só passagens concluídas no período. ' +
       'Gargalo é a etapa com mais horas_totais (soma do tempo de todas as máquinas), não a de maior mediana.',
     gargalo: ranked[0]?.etapa ?? null,
     etapas_sem_uso: unused,
@@ -236,11 +258,12 @@ export const VENDA_REGISTRADA = 'Venda registrada';
  * Fim: primeira vez que a máquina chega à etapa `ate` OU a uma etapa posterior,
  * porque a equipe às vezes pula etapas. Quantas pularam é informado à parte.
  */
-export function tempoEntreEtapas(
+export async function tempoEntreEtapas(
   db: Db,
   clock: Clock,
-  args: { de: string; ate: Status; dias: number; agrupar_por?: 'tecnico' | 'plataforma' | 'empresa' },
+  args: { de: string; ate: Status; dias: number; agrupar_por?: 'tecnico' | 'plataforma' | 'empresa'; horas?: Horas },
 ) {
+  const modo = args.horas ?? 'corridas';
   const since = daysAgo(clock, args.dias).getTime();
   const targetIndex = STATUSES.indexOf(args.ate);
   const fromIndex = args.de === VENDA_REGISTRADA ? -1 : STATUSES.indexOf(args.de as Status);
@@ -250,7 +273,7 @@ export function tempoEntreEtapas(
 
   const measured: Array<{ hours: number; skipped: boolean; group: string }> = [];
   let notYet = 0;
-  for (const t of loadTimelines(db, true)) {
+  for (const t of await loadTimelines(db, true)) {
     const start =
       fromIndex === -1 ? t.stays[0].enteredAt : t.stays.find((s) => STATUSES.indexOf(s.status) === fromIndex)?.enteredAt;
     if (!start) continue;
@@ -268,7 +291,7 @@ export function tempoEntreEtapas(
       : args.agrupar_por === 'empresa' ? t.company
       : 'todas';
     measured.push({
-      hours: (Date.parse(arrival.enteredAt) - Date.parse(start)) / HOUR,
+      hours: span(Date.parse(start), Date.parse(arrival.enteredAt), clock, modo),
       skipped: arrival.status !== args.ate,
       group,
     });
@@ -286,14 +309,16 @@ export function tempoEntreEtapas(
 
   const groups = [...new Set(measured.map((m) => m.group))]
     .map((group) => ({ grupo: group, ...stats(measured.filter((m) => m.group === group).map((m) => m.hours)) }))
-    .sort((a, b) => b.maquinas - a.maquinas);
+    .sort((a, b) => b.maquinas - a.maquinas || a.grupo.localeCompare(b.grupo, 'pt-BR'));
 
   return {
     de: args.de,
     ate: args.ate,
     periodo_dias: args.dias,
+    ...modoInfo(clock, modo),
     observacao:
-      'Horas corridas. Conta máquinas que chegaram ao destino no período. ' +
+      (modo === 'uteis' ? 'Horas úteis. ' : 'Horas corridas. ') +
+      'Conta máquinas que chegaram ao destino no período. ' +
       'A média é puxada por poucos casos muito longos; a mediana mostra o caso típico.',
     ...stats(measured.map((m) => m.hours)),
     chegaram_pulando_a_etapa: measured.filter((m) => m.skipped).length,
@@ -302,9 +327,9 @@ export function tempoEntreEtapas(
   };
 }
 
-export function produtividade(db: Db, clock: Clock, args: { dias: number }) {
+export async function produtividade(db: Db, clock: Clock, args: { dias: number }) {
   const since = daysAgo(clock, args.dias).toISOString();
-  const rows = all(
+  const rows = await all(
     db,
     `SELECT COALESCE(i.technician, 'Sem técnico') AS tecnico,
             SUM(CASE WHEN h.description LIKE '%para Pronta.' THEN 1 ELSE 0 END) AS prontas,
@@ -312,10 +337,10 @@ export function produtividade(db: Db, clock: Clock, args: { dias: number }) {
        FROM item_history h JOIN sale_items i ON i.id = h.item_id
       WHERE h.created_at >= $since AND ${ACTIVE}
         AND (h.description LIKE '%para Pronta.' OR h.description LIKE '%para Entregue/Enviada.')
-      GROUP BY tecnico ORDER BY prontas DESC`,
+      GROUP BY tecnico ORDER BY prontas DESC, tecnico`,
     { $since: since },
   );
-  const perDay = all(
+  const perDay = await all(
     db,
     `SELECT substr(h.created_at, 1, 10) AS dia, COUNT(*) AS prontas
        FROM item_history h JOIN sale_items i ON i.id = h.item_id
@@ -340,10 +365,10 @@ const GROUP_COLUMNS = {
 
 export type Agrupamento = keyof typeof GROUP_COLUMNS;
 
-export function vendas(db: Db, clock: Clock, args: { dias: number; agrupar_por: Agrupamento }) {
+export async function vendas(db: Db, clock: Clock, args: { dias: number; agrupar_por: Agrupamento }) {
   const since = daysAgo(clock, args.dias).toISOString().slice(0, 10);
   const column = GROUP_COLUMNS[args.agrupar_por];
-  const rows = all(
+  const rows = await all(
     db,
     `SELECT ${column} AS grupo,
             COUNT(DISTINCT s.id) AS pedidos,
@@ -352,7 +377,7 @@ export function vendas(db: Db, clock: Clock, args: { dias: number; agrupar_por: 
             SUM(CASE WHEN COALESCE(i.commercial_state, 'active') = 'returned' THEN 1 ELSE 0 END) AS devolvidas
        FROM sales s JOIN sale_items i ON i.sale_id = s.id
       WHERE s.date >= $since
-      GROUP BY grupo ORDER BY ${args.agrupar_por === 'dia' ? 'grupo' : 'maquinas DESC'}`,
+      GROUP BY grupo ORDER BY ${args.agrupar_por === 'dia' ? 'grupo' : 'maquinas DESC, grupo'}`,
     { $since: since },
   );
   const grupos = rows.map((r) => ({
@@ -370,23 +395,23 @@ export function vendas(db: Db, clock: Clock, args: { dias: number; agrupar_por: 
   };
 }
 
-export function estoque(db: Db, args: { loja?: string }) {
+export async function estoque(db: Db, args: { loja?: string }) {
   const where = args.loja ? 'WHERE u.store = $loja' : '';
   const params = args.loja ? { $loja: args.loja } : {};
-  const byStatus = all(
+  const byStatus = await all(
     db,
     `SELECT u.status AS status, COALESCE(u.store, 'Sem loja') AS loja, COUNT(*) AS unidades
        FROM stock_units u ${where} GROUP BY u.status, loja ORDER BY loja, u.status`,
     params,
   );
-  const available = all(
+  const available = await all(
     db,
     `SELECT COALESCE(NULLIF(u.model, ''), p.name) AS modelo,
             SUM(CASE WHEN u.status = 'pronta' THEN 1 ELSE 0 END) AS prontas,
             SUM(CASE WHEN u.status IN ('recebida', 'em_triagem') THEN 1 ELSE 0 END) AS em_preparo
        FROM stock_units u JOIN product_suggestions p ON p.id = u.product_id
       ${args.loja ? 'WHERE u.store = $loja AND' : 'WHERE'} u.status <> 'vendida'
-      GROUP BY modelo ORDER BY prontas DESC, em_preparo DESC LIMIT 15`,
+      GROUP BY modelo ORDER BY prontas DESC, em_preparo DESC, modelo LIMIT 15`,
     params,
   );
   return {
@@ -421,9 +446,9 @@ function warrantyStatus(row: Row, now: Date) {
   return 'ativa';
 }
 
-export function consultarMaquina(db: Db, clock: Clock, args: { busca: string }) {
+export async function consultarMaquina(db: Db, clock: Clock, args: { busca: string }) {
   const term = args.busca.trim();
-  const items = all(
+  const items = await all(
     db,
     `SELECT i.id, i.internal_code, i.product_name, i.status, i.technician, i.serial_number, i.real_os,
             i.nf_number, i.withdrawn_by, i.withdrawn_at, i.packaged_by, i.packaged_at,
@@ -437,7 +462,7 @@ export function consultarMaquina(db: Db, clock: Clock, args: { busca: string }) 
     { $t: term },
   );
 
-  const stock = get(
+  const stock = await get(
     db,
     `SELECT u.status, u.store, u.location, u.model, u.os_number, u.triage_at, u.ready_at, u.sold_at,
             l.name AS lote, p.name AS produto
@@ -453,20 +478,22 @@ export function consultarMaquina(db: Db, clock: Clock, args: { busca: string }) 
     return { busca: term, encontrado: false, dica: 'Busque pela serial, pelo código interno (ex.: CAIJ-0001) ou pelo número da OS.' };
   }
 
-  const vendasDaMaquina = items.map((item) => {
+  const vendasDaMaquina = await Promise.all(items.map(async (item) => {
     const id = Number(item.id);
-    const history = all(
-      db,
-      `SELECT created_at, description FROM item_history WHERE item_id = $id ORDER BY created_at DESC, id DESC LIMIT 25`,
-      { $id: id },
+    const history = (
+      await all(
+        db,
+        `SELECT created_at, description FROM item_history WHERE item_id = $id ORDER BY created_at DESC, id DESC LIMIT 25`,
+        { $id: id },
+      )
     ).reverse();
-    const lifecycle = all(
+    const lifecycle = await all(
       db,
       `SELECT action, reason, actor_name, created_at FROM machine_lifecycle_events WHERE item_id = $id ORDER BY created_at`,
       { $id: id },
     );
     // Garantia: só situação e prazos. Nome, e-mail e telefone do cliente nunca são selecionados.
-    const warranty = get(
+    const warranty = await get(
       db,
       `SELECT warranty_months, purchase_date, activated_at, expires_at FROM warranties
         WHERE sale_item_id = $id OR (serial = $serial AND $serial <> '') ORDER BY created_at DESC LIMIT 1`,
@@ -509,7 +536,7 @@ export function consultarMaquina(db: Db, clock: Clock, args: { busca: string }) 
       })),
       historico: history.map((h) => ({ em: String(h.created_at), evento: String(h.description) })),
     };
-  });
+  }));
 
   return {
     busca: term,
