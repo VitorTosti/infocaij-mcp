@@ -76,24 +76,50 @@ interface Timeline {
 }
 
 /**
+ * Quais máquinas carregar. Só máquinas ativas (não canceladas nem devolvidas) entram nos cálculos.
+ * - `open`: só as que ainda não foram entregues.
+ * - `{ since }`: as em aberto mais as que tiveram alguma mudança de etapa (ou foram criadas) desde
+ *   `since`. Toda passagem concluída, chegada ou entrega no período é uma mudança no período, então o
+ *   resultado é o mesmo de carregar tudo, sem ler o histórico de meses de máquinas já entregues.
+ */
+type Scope = 'open' | { since: string };
+
+function scopeFilter(scope: Scope): { where: string; params: Record<string, unknown> } {
+  const open = `i.status <> $final`;
+  if (scope === 'open') return { where: `${ACTIVE} AND ${open}`, params: { $final: FINAL_STATUS } };
+  return {
+    // IN com subconsulta independente (calculada uma vez), e não EXISTS correlacionado: sem índice em
+    // item_history.item_id, o EXISTS percorreria o histórico inteiro para cada linha.
+    where: `${ACTIVE} AND (${open} OR i.created_at >= $since OR i.id IN (
+              SELECT c.item_id FROM item_history c
+               WHERE c.created_at >= $since AND c.description LIKE 'Status alterado de %'))`,
+    params: { $final: FINAL_STATUS, $since: scope.since },
+  };
+}
+
+/**
  * Reconstrói quanto tempo cada máquina passou em cada etapa a partir do
  * histórico ("Status alterado de X para Y."). A primeira etapa começa na
  * criação do item.
  */
-async function loadTimelines(db: Db, onlyActive: boolean): Promise<Timeline[]> {
+async function loadTimelines(db: Db, scope: Scope): Promise<Timeline[]> {
+  const { where, params } = scopeFilter(scope);
   const items = await all(
     db,
     `SELECT i.id, i.internal_code, i.product_name, i.status, i.technician, i.created_at,
             s.platform, s.company, s.is_priority
        FROM sale_items i JOIN sales s ON s.id = i.sale_id
-      ${onlyActive ? `WHERE ${ACTIVE}` : ''}
+      WHERE ${where}
       ORDER BY i.id`,
+    params,
   );
+  // O histórico completo de cada máquina escolhida: as etapas anteriores ao período definem onde ela estava.
   const history = await all(
     db,
-    `SELECT item_id, description, created_at FROM item_history
-      WHERE description LIKE 'Status alterado de %'
-      ORDER BY item_id, created_at, id`,
+    `SELECT h.item_id, h.description, h.created_at FROM item_history h JOIN sale_items i ON i.id = h.item_id
+      WHERE h.description LIKE 'Status alterado de %' AND ${where}
+      ORDER BY h.item_id, h.created_at, h.id`,
+    params,
   );
 
   const changesByItem = new Map<number, Row[]>();
@@ -137,7 +163,7 @@ function currentStay(timeline: Timeline): Stay {
 // ------------------------------------------------------------------- ferramentas
 
 export async function resumoFila(db: Db, clock: Clock) {
-  const open = (await loadTimelines(db, true)).filter((t) => t.status !== FINAL_STATUS);
+  const open = await loadTimelines(db, 'open');
 
   const etapas = STATUSES.filter((s) => s !== FINAL_STATUS).map((status) => {
     const here = open.filter((t) => t.status === status);
@@ -172,8 +198,7 @@ export async function itensParados(
   args: { etapa?: Status; horas_minimas: number; limite: number; horas?: Horas },
 ) {
   const modo = args.horas ?? 'corridas';
-  const stuck = (await loadTimelines(db, true))
-    .filter((t) => t.status !== FINAL_STATUS)
+  const stuck = (await loadTimelines(db, 'open'))
     .filter((t) => !args.etapa || t.status === args.etapa)
     .map((t) => ({ t, hours: span(Date.parse(currentStay(t).enteredAt), clock.now.getTime(), clock, modo) }))
     .filter(({ hours }) => hours >= args.horas_minimas)
@@ -197,15 +222,18 @@ export async function itensParados(
   };
 }
 
-export async function tempoPorEtapa(db: Db, clock: Clock, args: { dias: number; horas?: Horas }) {
-  const modo = args.horas ?? 'corridas';
-  const since = daysAgo(clock, args.dias).getTime();
-  const timelines = await loadTimelines(db, true);
+const WEEK = 7 * 24 * HOUR;
 
+/** Passagens concluídas, gargalo e tempo de venda até entrega para saídas em [fromMs, toMs). */
+function stageStats(timelines: Timeline[], fromMs: number, toMs: number, clock: Clock, modo: Horas) {
+  const inWindow = (iso: string) => {
+    const t = Date.parse(iso);
+    return t >= fromMs && t < toMs;
+  };
   const etapas = STATUSES.filter((s) => s !== FINAL_STATUS).map((status) => {
     const durations = timelines
       .flatMap((t) => t.stays)
-      .filter((stay) => stay.status === status && stay.leftAt && Date.parse(stay.leftAt) >= since)
+      .filter((stay) => stay.status === status && stay.leftAt && inWindow(stay.leftAt))
       .map((stay) => span(Date.parse(stay.enteredAt), Date.parse(stay.leftAt as string), clock, modo))
       .sort((a, b) => a - b);
     return {
@@ -222,15 +250,52 @@ export async function tempoPorEtapa(db: Db, clock: Clock, args: { dias: number; 
   // etapas em que a maioria passa rápido, mas algumas ficam dias (cauda longa).
   const total = etapas.reduce((sum, e) => sum + e.horas_totais, 0);
   for (const e of etapas) e.participacao_pct = total ? Math.round((e.horas_totais / total) * 100) : 0;
-  const unused = etapas.filter((e) => e.passagens === 0).map((e) => e.etapa);
   const ranked = etapas.filter((e) => e.passagens >= 5).sort((a, b) => b.horas_totais - a.horas_totais);
 
   const leadTimes = timelines
     .filter((t) => t.status === FINAL_STATUS)
     .map((t) => ({ start: t.stays[0].enteredAt, end: currentStay(t).enteredAt }))
-    .filter(({ end }) => Date.parse(end) >= since)
+    .filter(({ end }) => inWindow(end))
     .map(({ start, end }) => span(Date.parse(start), Date.parse(end), clock, modo))
     .sort((a, b) => a - b);
+
+  return {
+    etapas,
+    gargalo: ranked[0]?.etapa ?? null,
+    venda_ate_entrega: {
+      maquinas: leadTimes.length,
+      mediana_horas: round1(percentile(leadTimes, 0.5)),
+      p90_horas: round1(percentile(leadTimes, 0.9)),
+    },
+  };
+}
+
+export async function tempoPorEtapa(db: Db, clock: Clock, args: { dias: number; horas?: Horas; por_semana?: boolean }) {
+  const modo = args.horas ?? 'corridas';
+  const now = clock.now.getTime();
+  const since = daysAgo(clock, args.dias).getTime();
+  // Semanas de 7 dias terminando agora, da mais antiga para a mais recente, cobrindo o período inteiro.
+  const weeks = args.por_semana ? Math.ceil(args.dias / 7) : 0;
+  const earliest = Math.min(since, now - weeks * WEEK);
+  const timelines = await loadTimelines(db, { since: new Date(earliest).toISOString() });
+
+  // Sem limite superior: um evento registrado depois de `now` (relógio fixo em demonstrações) entra no
+  // período atual, como sempre entrou.
+  const { etapas, gargalo, venda_ate_entrega } = stageStats(timelines, since, Infinity, clock, modo);
+
+  const semanas = Array.from({ length: weeks }, (_, i) => {
+    const start = now - (weeks - i) * WEEK;
+    const end = now - (weeks - i - 1) * WEEK;
+    const week = stageStats(timelines, start, i === weeks - 1 ? Infinity : end, clock, modo);
+    return {
+      inicio: new Date(start).toISOString(),
+      fim: new Date(end).toISOString(),
+      passagens: week.etapas.reduce((sum, e) => sum + e.passagens, 0),
+      gargalo: week.gargalo,
+      venda_ate_entrega: week.venda_ate_entrega,
+      etapas: week.etapas.map(({ etapa, passagens, mediana_horas, horas_totais }) => ({ etapa, passagens, mediana_horas, horas_totais })),
+    };
+  });
 
   return {
     periodo_dias: args.dias,
@@ -238,15 +303,16 @@ export async function tempoPorEtapa(db: Db, clock: Clock, args: { dias: number; 
     observacao:
       (modo === 'uteis' ? 'Horas úteis (fora do expediente não conta). ' : 'Horas corridas, não horas úteis. ') +
       'Considera só passagens concluídas no período. ' +
-      'Gargalo é a etapa com mais horas_totais (soma do tempo de todas as máquinas), não a de maior mediana.',
-    gargalo: ranked[0]?.etapa ?? null,
-    etapas_sem_uso: unused,
-    venda_ate_entrega: {
-      maquinas: leadTimes.length,
-      mediana_horas: round1(percentile(leadTimes, 0.5)),
-      p90_horas: round1(percentile(leadTimes, 0.9)),
-    },
+      'Gargalo é a etapa com mais horas_totais (soma do tempo de todas as máquinas), não a de maior mediana.' +
+      (weeks
+        ? ` semanas: ${weeks} blocos de 7 dias terminando agora, do mais antigo ao mais recente; ` +
+          'gargalo da semana exige pelo menos 5 passagens na etapa, senão vem null.'
+        : ''),
+    gargalo,
+    etapas_sem_uso: etapas.filter((e) => e.passagens === 0).map((e) => e.etapa),
+    venda_ate_entrega,
     etapas,
+    ...(weeks ? { semanas } : {}),
   };
 }
 
@@ -273,7 +339,7 @@ export async function tempoEntreEtapas(
 
   const measured: Array<{ hours: number; skipped: boolean; group: string }> = [];
   let notYet = 0;
-  for (const t of await loadTimelines(db, true)) {
+  for (const t of await loadTimelines(db, { since: new Date(since).toISOString() })) {
     const start =
       fromIndex === -1 ? t.stays[0].enteredAt : t.stays.find((s) => STATUSES.indexOf(s.status) === fromIndex)?.enteredAt;
     if (!start) continue;

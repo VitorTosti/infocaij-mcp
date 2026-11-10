@@ -16,7 +16,7 @@
  *   INFOCAIJ_FUSO           fuso do expediente, "-03:00" (opcional)
  */
 import readline from 'node:readline';
-import { openDb, type Source } from './db.ts';
+import { closeShared, withDb, type Source } from './db.ts';
 import { scheduleFromEnv } from './horario.ts';
 import { ERROR, SERVER_INFO, createHandler } from './protocol.ts';
 
@@ -41,8 +41,9 @@ try {
 }
 
 // Falha cedo se o caminho ou a conexão estiverem errados, em vez de na primeira pergunta.
+// No PostgreSQL, a conexão aberta aqui fica de pé para as chamadas seguintes.
 try {
-  await (await openDb(source)).close();
+  await withDb(source, async () => {});
 } catch (error) {
   fail(`Não consegui abrir o banco: ${(error as Error).message}`);
 }
@@ -79,6 +80,7 @@ lines.on('line', (line) => {
 // Ao fechar a entrada, termina o que está em andamento antes de sair.
 lines.on('close', async () => {
   await handle.idle();
+  await closeShared(source).catch(() => {});
   process.exit(0);
 });
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => process.exit(0));

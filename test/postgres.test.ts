@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { demoDb, handlerFor, handlerForSource, call, NOW } from './helpers.ts';
 import { toPositional, normalizeRow, openPostgres, type PgLoader } from '../src/postgres.ts';
-import { assertReadOnlySql, openDb } from '../src/db.ts';
+import { assertReadOnlySql, closeShared, openDb, type Source } from '../src/db.ts';
 import { TOOLS } from '../src/tools.ts';
 
 test('toPositional troca $nome por $1, $2 e reaproveita o número do mesmo nome', () => {
@@ -33,13 +33,27 @@ test('só SELECT e WITH, e um comando por vez', () => {
  * receberia), e o executa no banco de demonstração. Assim as 8 ferramentas passam de verdade pela
  * tradução de parâmetros e pelo adaptador, e os resultados podem ser comparados com os do SQLite.
  */
-function fakePg(dbPath: string, log: Array<{ text: string; values?: unknown[] }> = [], config: Array<Record<string, unknown>> = []) {
+function fakePg(
+  dbPath: string,
+  log: Array<{ text: string; values?: unknown[] }> = [],
+  config: Array<Record<string, unknown>> = [],
+  clients: Array<{ emit: (event: 'error' | 'end') => void; ended: boolean }> = [],
+) {
   class FakeClient {
     private db: DatabaseSync;
+    private listeners: Record<string, Array<(error?: Error) => void>> = {};
     ended = false;
     constructor(cfg: Record<string, unknown>) {
       config.push(cfg);
       this.db = new DatabaseSync(dbPath, { readOnly: true });
+      clients.push(this);
+    }
+    on(event: string, listener: (error?: Error) => void) {
+      (this.listeners[event] ??= []).push(listener);
+    }
+    /** Simula o pg avisando que a conexão caiu. */
+    emit(event: 'error' | 'end') {
+      for (const listener of this.listeners[event] ?? []) listener(new Error('conexão perdida'));
     }
     async connect() {}
     async query(text: string, values: unknown[] = []) {
@@ -94,6 +108,48 @@ test('as 8 ferramentas dão o mesmo resultado pelo caminho PostgreSQL e pelo SQL
     assert.equal(b.isError, false, `${tool.name}: ${b.text}`);
     assert.deepEqual(b.json(), a.json(), tool.name);
   }
+});
+
+test('PostgreSQL: a conexão é reaproveitada entre chamadas, e não reaberta a cada pergunta', async () => {
+  const config: Array<Record<string, unknown>> = [];
+  const clients: Array<{ emit: (event: 'error' | 'end') => void; ended: boolean }> = [];
+  const source: Source = { kind: 'postgres', url: 'postgres://x', load: fakePg(demoDb(), [], config, clients) };
+  const handle = handlerForSource(source);
+  for (const tool of ['resumo_fila', 'tempo_por_etapa', 'vendas']) {
+    assert.equal((await call(handle, tool)).isError, false, tool);
+  }
+  assert.equal(config.length, 1, 'três chamadas, uma conexão');
+  await closeShared(source);
+  assert.equal(clients[0].ended, true);
+});
+
+test('PostgreSQL: se a conexão cai, a próxima chamada abre outra', async () => {
+  const config: Array<Record<string, unknown>> = [];
+  const clients: Array<{ emit: (event: 'error' | 'end') => void; ended: boolean }> = [];
+  const source: Source = { kind: 'postgres', url: 'postgres://x', load: fakePg(demoDb(), [], config, clients) };
+  const handle = handlerForSource(source);
+  assert.equal((await call(handle, 'resumo_fila')).isError, false);
+  clients[0].emit('error'); // banco reiniciou, por exemplo; sem ouvinte isso derrubaria o processo
+  assert.equal((await call(handle, 'resumo_fila')).isError, false);
+  assert.equal(config.length, 2);
+  await closeShared(source);
+});
+
+test('PostgreSQL: falha ao conectar não fica guardada; a próxima tentativa conecta de novo', async () => {
+  let attempts = 0;
+  const working = fakePg(demoDb());
+  const flaky: PgLoader = async () => {
+    attempts++;
+    if (attempts === 1) throw new Error('banco fora do ar');
+    return working();
+  };
+  const source: Source = { kind: 'postgres', url: 'postgres://x', load: flaky };
+  const handle = handlerForSource(source);
+  const first = await call(handle, 'resumo_fila');
+  assert.equal(first.isError, true);
+  assert.match(first.text, /banco fora do ar/);
+  assert.equal((await call(handle, 'resumo_fila')).isError, false);
+  await closeShared(source);
 });
 
 test('a fonte postgres sem o driver instalado falha com mensagem útil', async () => {

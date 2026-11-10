@@ -9,9 +9,24 @@ import type { Source } from '../src/db.ts';
 
 export const NOW = DEFAULT_NOW;
 
+const created: string[] = [];
+
+/** Pasta temporária apagada quando o processo de teste termina (cada arquivo de teste roda no seu). */
 export function tempDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'infocaij-mcp-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'infocaij-mcp-'));
+  created.push(dir);
+  return dir;
 }
+
+process.on('exit', () => {
+  for (const dir of created) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+    } catch {
+      // No Windows um arquivo ainda aberto impede a remoção; não vale derrubar a suíte por isso.
+    }
+  }
+});
 
 export function demoDb() {
   const file = path.join(tempDir(), 'demo.sqlite');

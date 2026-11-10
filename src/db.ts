@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
-import { openPostgres } from './postgres.ts';
+import { openPostgres, type PgLoader } from './postgres.ts';
 
 export type Row = Record<string, unknown>;
 
@@ -10,12 +10,14 @@ export interface Db {
   all(sql: string, params?: Record<string, unknown>): Promise<Row[]>;
   get(sql: string, params?: Record<string, unknown>): Promise<Row | undefined>;
   close(): Promise<void>;
+  /** Conexão persistente ainda utilizável. Ausente: a conexão é aberta e fechada a cada uso. */
+  isAlive?(): boolean;
 }
 
-/** De onde vêm os dados. `custom` existe para testes. */
+/** De onde vêm os dados. `custom` existe para testes; `load` troca o driver pg (também para testes). */
 export type Source =
   | { kind: 'sqlite'; path: string }
-  | { kind: 'postgres'; url: string }
+  | { kind: 'postgres'; url: string; load?: PgLoader }
   | { kind: 'custom'; open: () => Promise<Db> };
 
 /**
@@ -67,11 +69,40 @@ function openSqlite(filePath: string): Db {
 
 export async function openDb(source: Source): Promise<Db> {
   if (source.kind === 'sqlite') return openSqlite(source.path);
-  if (source.kind === 'postgres') return openPostgres(source.url);
+  if (source.kind === 'postgres') return openPostgres(source.url, source.load);
   return source.open();
 }
 
+/**
+ * Conexões PostgreSQL reaproveitadas entre chamadas, uma por fonte. Abrir uma conexão custa uma ida e
+ * volta de rede e a autenticação; reabrir a cada pergunta deixava cada ferramenta mais lenta à toa.
+ * O SQLite continua abrindo o arquivo a cada uso, de propósito (ver openReadOnly).
+ */
+const shared = new WeakMap<Source, Promise<Db>>();
+
+async function sharedDb(source: Source): Promise<Db> {
+  const cached = shared.get(source);
+  if (cached) {
+    const db = await cached.catch(() => null);
+    if (db && db.isAlive?.() !== false) return db;
+    shared.delete(source);
+  }
+  const opening = openDb(source);
+  shared.set(source, opening);
+  opening.catch(() => shared.delete(source));
+  return opening;
+}
+
+/** Fecha a conexão persistente da fonte, se houver. */
+export async function closeShared(source: Source): Promise<void> {
+  const cached = shared.get(source);
+  shared.delete(source);
+  const db = await cached?.catch(() => null);
+  await db?.close();
+}
+
 export async function withDb<T>(source: Source, fn: (db: Db) => Promise<T>): Promise<T> {
+  if (source.kind === 'postgres') return fn(await sharedDb(source));
   const db = await openDb(source);
   try {
     return await fn(db);

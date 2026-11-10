@@ -25,7 +25,7 @@ Servidor [Model Context Protocol](https://modelcontextprotocol.io) que conecta o
 | "Como está a bancada agora?" | `resumo_fila` | Máquinas por etapa, prioritárias e a mais antiga de cada etapa |
 | "O que está travado há mais de 2 dias?" | `itens_parados` | Tempo desde a última mudança de etapa, filtrável por etapa |
 | "Quanto tempo da venda até a máquina ficar pronta?" | `tempo_entre_etapas` | Média, mediana e p90 entre dois pontos da fila, por técnico, plataforma ou empresa; conta quem pulou etapas |
-| "Onde a fila trava?" | `tempo_por_etapa` | Mediana e p90 de cada etapa, reconstruídos do histórico, e o gargalo |
+| "Onde a fila trava? Está melhorando?" | `tempo_por_etapa` | Mediana e p90 de cada etapa, reconstruídos do histórico, e o gargalo; com `por_semana`, a evolução semana a semana |
 | "Quantas máquinas a bancada fechou esta semana?" | `produtividade` | Máquinas que chegaram a Pronta e a Entregue, por técnico e por dia |
 | "Quanto vendemos por plataforma?" | `vendas` | Pedidos, máquinas, cancelamentos e devoluções por plataforma, empresa, vendedor ou dia |
 | "Temos ThinkPad pronto?" | `estoque` | Unidades por situação e loja, e modelos disponíveis |
@@ -41,7 +41,11 @@ E três **prompts** prontos, que o usuário escolhe no menu do Claude:
 
 ### Horas corridas ou úteis
 
-`itens_parados`, `tempo_por_etapa` e `tempo_entre_etapas` aceitam `horas: "uteis"`. Uma máquina que entra em "Aguardando nota fiscal" na sexta às 17h e continua lá na segunda às 11h está há **66 h corridas**, mas só **4 h úteis**. O padrão é segunda a sexta, 08:00 às 18:00, fuso de Brasília, sem feriados; dá para mudar com `INFOCAIJ_HORARIO_UTIL`, `INFOCAIJ_DIAS_UTEIS` e `INFOCAIJ_FUSO` (ver [Configuração](#configuração)). O resultado informa em `horas` qual medida foi usada e, em horas úteis, o expediente aplicado.
+`itens_parados`, `tempo_por_etapa` e `tempo_entre_etapas` aceitam `horas: "uteis"`. Uma máquina que entra em "Aguardando nota fiscal" na sexta às 17h e continua lá na segunda às 11h está há **66 h corridas**, mas só **4 h úteis**. O padrão é segunda a sexta, 08:00 às 18:00, fuso de Brasília, sem expediente nos feriados nacionais (inclusive a Sexta-feira Santa, calculada a partir da Páscoa). Se a segunda do exemplo fosse 12 de outubro, sobraria **1 h útil**. Dá para mudar com `INFOCAIJ_HORARIO_UTIL`, `INFOCAIJ_DIAS_UTEIS`, `INFOCAIJ_FUSO`, `INFOCAIJ_FERIADOS` e `INFOCAIJ_FERIADOS_NACIONAIS` (ver [Configuração](#configuração)). O resultado informa em `horas` qual medida foi usada e, em horas úteis, o expediente aplicado.
+
+### Tendência semana a semana
+
+`tempo_por_etapa` com `por_semana: true` devolve, além do período inteiro, uma lista `semanas`: blocos de 7 dias terminando agora, do mais antigo ao mais recente, cada um com o gargalo, o tempo por etapa e o tempo da venda até a entrega. Assim "está melhorando?" e "o gargalo mudou?" se respondem numa chamada só, e o prompt `relatorio_semanal` usa isso para comparar a semana com as três anteriores. Um teste confere que as semanas somam exatamente as passagens do período e que a mais recente bate com `dias: 7`.
 
 ### Saída estruturada
 
@@ -61,7 +65,7 @@ O ponto central é o **`tempo_por_etapa`**. O InfoCAIJ não guarda quanto tempo 
 
 ## Decisões de projeto
 
-**Somente leitura em duas camadas.** O arquivo é aberto com `readOnly` pelo driver e a conexão recebe `PRAGMA query_only`. Um teste roda todas as ferramentas e confere que o hash do banco não muda.
+**Somente leitura em três camadas.** O arquivo é aberto com `readOnly` pelo driver, a conexão recebe `PRAGMA query_only` (no PostgreSQL, `default_transaction_read_only`) e o adaptador recusa qualquer SQL que não seja um único `SELECT` ou `WITH`. Um teste roda todas as ferramentas e confere que o hash do banco não muda.
 
 **Nenhum dado pessoal de cliente.** O banco tem nomes, e-mails e telefones de clientes em garantias e cadastros. Nenhuma consulta seleciona essas colunas, e não há `SELECT *`. O banco de demonstração planta dados pessoais falsos, e um teste consulta todas as 314 máquinas com garantia para provar que nada vaza.
 
@@ -69,11 +73,11 @@ O ponto central é o **`tempo_por_etapa`**. O InfoCAIJ não guarda quanto tempo 
 
 **A descrição da ferramenta é o prompt.** O modelo escolhe a ferramenta lendo a descrição, então cada uma diz quando usá-la, com exemplos de pergunta. Erros de argumento voltam como resultado com `isError`, para o modelo corrigir a chamada sozinho em vez de a conversa quebrar.
 
-**Zero dependências.** O protocolo MCP (JSON-RPC 2.0 por stdio) está implementado em cerca de 170 linhas, com o `node:sqlite` embutido no Node. Para um servidor que lê dados da empresa, isso significa nada de terceiros para auditar e instalação com um `git clone`.
+**Zero dependências.** O protocolo MCP (JSON-RPC 2.0 por stdio) está implementado em cerca de 200 linhas, com o `node:sqlite` embutido no Node. Para um servidor que lê dados da empresa, isso significa nada de terceiros para auditar e instalação com um `git clone`.
 
 ## Avaliado com o modelo, não só com testes
 
-Além dos 56 testes automatizados, o servidor foi conectado ao Claude Code e testado com perguntas reais. Uma das sessões mostrou um problema que nenhum teste unitário pegaria:
+Além dos 65 testes automatizados, o servidor foi conectado ao Claude Code e testado com perguntas reais. Uma das sessões mostrou um problema que nenhum teste unitário pegaria:
 
 | | |
 |:--|:--|
@@ -99,7 +103,7 @@ Requer **Node.js 22.18 ou superior** (roda TypeScript direto, sem build). Nada p
 ```bash
 git clone https://github.com/VitorTosti/infocaij-mcp.git
 cd infocaij-mcp
-npm test          # 56 testes
+npm test          # 65 testes
 npm run seed      # cria demo/infocaij-demo.sqlite com dados fictícios
 ```
 
@@ -177,15 +181,19 @@ O banco de demonstração simula 45 dias de operação (cerca de 480 máquinas e
 | `INFOCAIJ_HORARIO_UTIL` | Expediente para horas úteis | `08:00-18:00` |
 | `INFOCAIJ_DIAS_UTEIS` | Dias úteis (1 = segunda, 7 = domingo) | `1-5` |
 | `INFOCAIJ_FUSO` | Fuso do expediente | `-03:00` |
+| `INFOCAIJ_FERIADOS` | Outras datas sem expediente: `AAAA-MM-DD` (uma vez) ou `MM-DD` (todo ano), separadas por vírgula. Ex.: Carnaval e feriado municipal | (nenhuma) |
+| `INFOCAIJ_FERIADOS_NACIONAIS` | `nao` deixa de descontar os feriados nacionais | `sim` |
 | `INFOCAIJ_MCP_NOW` | Data e hora fixas, para demonstrações e testes | agora |
 
 ## Robustez
 
-- **Tempo limite**: uma consulta que passa do limite volta como erro para o modelo (que pode tentar um período menor), e a conexão é fechada quando ela termina.
+- **Tempo limite**: uma consulta que passa do limite volta como erro para o modelo (que pode tentar um período menor), e, no PostgreSQL, o `statement_timeout` da sessão interrompe a consulta no próprio banco.
 - **Tamanho**: uma resposta maior que 200 mil caracteres é recusada com orientação, em vez de estourar o contexto do modelo.
 - **Concorrência e cancelamento**: os pedidos rodam em paralelo, então uma consulta lenta não trava um `ping`. Um `notifications/cancelled` do cliente descarta a resposta.
 - **Encerramento**: ao fechar a entrada, o servidor termina o que está em andamento antes de sair.
 - **Entrada**: uma linha maior que 1 MB é recusada sem derrubar o servidor, e uma configuração inválida impede a partida com uma mensagem clara.
+- **Conexão PostgreSQL reaproveitada**: a conexão fica aberta entre as perguntas, em vez de abrir e autenticar a cada chamada. Se o banco reiniciar ou a rede cair, a próxima chamada abre outra, e uma falha ao conectar não fica guardada.
+- **Só o histórico necessário**: `tempo_por_etapa` e `tempo_entre_etapas` carregam as máquinas em aberto e as que mudaram de etapa no período, não o histórico inteiro do banco. Com 7 dias, o banco de demonstração lê 446 linhas de histórico em vez de 3.183, com resultado idêntico (conferido em 390 combinações de argumentos).
 - **Ordem determinística**: toda consulta com empate tem desempate explícito, para SQLite e PostgreSQL darem o mesmo resultado.
 
 ## Estrutura
@@ -196,7 +204,7 @@ src/
   protocol.ts   MCP: initialize, tools/*, prompts/*, tempo limite, cancelamento, erros JSON-RPC
   tools.ts      definição, descrição, validação e esquema de saída das 8 ferramentas
   queries.ts    consultas e reconstrução da linha do tempo por máquina
-  horario.ts    horas úteis e leitura do expediente
+  horario.ts    horas úteis, feriados e leitura do expediente
   prompts.ts    os 3 prompts prontos
   db.ts         acesso somente leitura (SQLite) e a interface comum
   postgres.ts   adaptador PostgreSQL (driver pg opcional)
@@ -209,7 +217,7 @@ docs/demonstracao.md   sessões reais com o Claude
 
 ## Limitações
 
-- Horas úteis não descontam feriados.
+- Os feriados nacionais são descontados; estaduais, municipais e pontos facultativos (Carnaval, Corpus Christi) entram só se listados em `INFOCAIJ_FERIADOS`.
 - O técnico de `produtividade` é o responsável atual da máquina, não necessariamente quem a moveu de etapa. O `item_history` do InfoCAIJ não grava quem fez cada mudança de status, então atribuir pelo evento exigiria o sistema registrar o autor.
 - O adaptador PostgreSQL foi validado contra um PostgreSQL em memória (`pg-mem`) com o mesmo esquema do InfoCAIJ e contra um driver falso nos testes, mas ainda não contra o banco de produção. Rode primeiro contra uma cópia.
 

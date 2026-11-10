@@ -37,7 +37,7 @@ export const PROMPTS: PromptDefinition[] = [
 
 Passos:
 1. Chame resumo_fila para a situação atual.
-2. Chame tempo_por_etapa com dias = 7 e depois com dias = 30, para comparar a semana com o mês.
+2. Chame tempo_por_etapa com dias = 28 e por_semana = true. O resultado geral é o mês; o último item de "semanas" é esta semana e os anteriores mostram a tendência.
 3. Chame itens_parados com horas_minimas = 72.
 4. Chame produtividade com dias = 7.
 5. Chame vendas com dias = 7 e agrupar_por = "plataforma".
@@ -47,7 +47,7 @@ Formato da resposta:
 Uma frase com o número que mais importa (entregas da semana) e se melhorou ou piorou em relação ao mês.
 
 ## Onde a fila trava
-A etapa gargalo, com mediana da semana e do mês lado a lado. Se mudou, diga qual era antes.
+A etapa gargalo, com mediana da semana e do mês lado a lado. Se mudou, diga qual era antes e em que semana mudou.
 
 ## Para resolver hoje
 Até 5 máquinas paradas há mais tempo: código, produto, etapa e há quanto tempo. Prioritárias primeiro.

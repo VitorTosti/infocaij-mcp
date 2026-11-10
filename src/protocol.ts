@@ -7,15 +7,15 @@ import { findPrompt, listPrompts } from './prompts.ts';
  */
 
 export const SUPPORTED_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
-export const SERVER_INFO = { name: 'infocaij-mcp', title: 'InfoCAIJ', version: '0.2.0' };
+export const SERVER_INFO = { name: 'infocaij-mcp', title: 'InfoCAIJ', version: '0.3.0' };
 
 /** Saída estruturada (structuredContent e outputSchema) existe a partir desta versão do protocolo. */
 const STRUCTURED_SINCE = '2025-06-18';
 
 const INSTRUCTIONS = `Servidor somente leitura sobre o InfoCAIJ, o sistema que acompanha vendas, bancada técnica, estoque e garantia de notebooks na CAIJ Informática.
 Fluxo de cada máquina: Pendente → Em preparacao → Aguardando teste → Pronta → Aguardando retirada → Aguardando nota fiscal → Aguardando embalagem → Entregue/Enviada.
-Comece por resumo_fila em perguntas gerais. Para "onde trava", use tempo_por_etapa. Para uma máquina específica, use consultar_maquina.
-Tempos vêm em horas corridas; para julgar atraso real use horas = "uteis", que desconta noites e fins de semana.
+Comece por resumo_fila em perguntas gerais. Para "onde trava", use tempo_por_etapa; para "está melhorando?", tempo_por_etapa com por_semana = true. Para uma máquina específica, use consultar_maquina.
+Tempos vêm em horas corridas; para julgar atraso real use horas = "uteis", que desconta noites, fins de semana e feriados nacionais.
 Nenhuma ferramenta altera dados e nenhuma retorna dados pessoais de clientes.`;
 
 export const ERROR = {

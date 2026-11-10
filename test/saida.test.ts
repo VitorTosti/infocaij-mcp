@@ -12,6 +12,7 @@ const CASES: Array<[string, Record<string, unknown>]> = [
   ['itens_parados', { horas: 'uteis', horas_minimas: 8 }],
   ['tempo_por_etapa', {}],
   ['tempo_por_etapa', { horas: 'uteis' }],
+  ['tempo_por_etapa', { dias: 30, por_semana: true }],
   ['tempo_entre_etapas', { ate: 'Pronta' }],
   ['tempo_entre_etapas', { ate: 'Pronta', agrupar_por: 'tecnico', horas: 'uteis' }],
   ['produtividade', {}],

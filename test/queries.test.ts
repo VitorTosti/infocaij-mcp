@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { tinyDb, handlerFor, call } from './helpers.ts';
+import { tinyDb, demoDb, handlerFor, handlerForSource, call } from './helpers.ts';
+import { openDb, type Source } from '../src/db.ts';
 import { parseStatusChange } from '../src/domain.ts';
 
 const NOW = '2026-10-10T12:00:00.000Z';
@@ -158,4 +159,63 @@ test('tempo_entre_etapas mede da venda registrada até Pronta e conta quem pulou
 
   const backwards = (await call(handle, 'tempo_entre_etapas', { de: 'Pronta', ate: 'Aguardando teste' }));
   assert.equal(backwards.isError, true);
+});
+
+test('janela curta lê só o histórico das máquinas que importam para o período', async () => {
+  // Conta as linhas de histórico que o servidor carrega, por fora do driver.
+  const dbPath = demoDb();
+  let historyRows = 0;
+  const source: Source = {
+    kind: 'custom',
+    open: async () => {
+      const db = await openDb({ kind: 'sqlite', path: dbPath });
+      const count = (sql: string, rows: unknown[]) => {
+        if (/^\s*SELECT h\.item_id, h\.description/.test(sql)) historyRows += rows.length;
+        return rows;
+      };
+      return { ...db, all: async (sql, params) => count(sql, await db.all(sql, params)) };
+    },
+  };
+  const handle = handlerForSource(source);
+  const read = async (args: Record<string, unknown>) => {
+    historyRows = 0;
+    assert.equal((await call(handle, 'tempo_por_etapa', args)).isError, false);
+    return historyRows;
+  };
+  const year = await read({ dias: 365 });
+  const week = await read({ dias: 7 });
+  assert.ok(year > 0);
+  assert.ok(week < year / 2, `7 dias leu ${week} linhas; 365 dias leu ${year}`);
+});
+
+test('tempo_por_etapa por_semana: as semanas somam o período e a última é igual a dias = 7', async () => {
+  const handle = handlerFor(demoDb());
+  const mes = (await call(handle, 'tempo_por_etapa', { dias: 28, por_semana: true })).json();
+  const semana = (await call(handle, 'tempo_por_etapa', { dias: 7 })).json();
+  assert.equal(mes.semanas.length, 4);
+  // Blocos contíguos, do mais antigo ao mais recente.
+  for (let i = 1; i < mes.semanas.length; i++) assert.equal(mes.semanas[i].inicio, mes.semanas[i - 1].fim);
+  // Toda passagem do período cai em exatamente uma semana.
+  const total = mes.etapas.reduce((sum: number, e: any) => sum + e.passagens, 0);
+  assert.equal(mes.semanas.reduce((sum: number, s: any) => sum + s.passagens, 0), total);
+  assert.ok(total > 0);
+  // A semana mais recente bate com a chamada de 7 dias.
+  const ultima = mes.semanas.at(-1);
+  assert.equal(ultima.gargalo, semana.gargalo);
+  assert.deepEqual(ultima.venda_ate_entrega, semana.venda_ate_entrega);
+  assert.deepEqual(
+    ultima.etapas,
+    semana.etapas.map(({ etapa, passagens, mediana_horas, horas_totais }: any) => ({ etapa, passagens, mediana_horas, horas_totais })),
+  );
+  // Sem por_semana, o resultado não muda de forma.
+  assert.equal('semanas' in semana, false);
+});
+
+test('tempo_por_etapa por_semana: período que não fecha semana arredonda para cima', async () => {
+  const handle = handlerFor(demoDb());
+  const r = (await call(handle, 'tempo_por_etapa', { dias: 10, por_semana: true })).json();
+  assert.equal(r.semanas.length, 2);
+  const bad = await call(handle, 'tempo_por_etapa', { por_semana: 'sim' });
+  assert.equal(bad.isError, true);
+  assert.match(bad.text, /por_semana deve ser true ou false/);
 });

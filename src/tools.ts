@@ -57,7 +57,7 @@ const HORAS_IN = {
   enum: ['corridas', 'uteis'],
   default: 'corridas',
   description:
-    '"corridas" (padrão) conta o relógio todo; "uteis" desconta noites e fins de semana (expediente configurado no servidor). ' +
+    '"corridas" (padrão) conta o relógio todo; "uteis" desconta noites, fins de semana e feriados (expediente configurado no servidor). ' +
     'Prefira "uteis" para julgar se algo está atrasado de verdade.',
 };
 
@@ -130,12 +130,19 @@ export const TOOLS: ToolDefinition[] = [
       'Quanto tempo as máquinas passam em cada etapa (mediana, percentil 90 e soma de horas), calculado a partir do histórico de mudanças de status. ' +
       'O gargalo é a etapa onde as máquinas somam mais horas paradas: uma etapa pode ter mediana baixa e ainda ser o gargalo se algumas máquinas ficam dias nela (veja p90). ' +
       'Também lista etapas que a equipe não está usando e o tempo total da venda até a entrega. ' +
-      'Use para "onde a fila trava?", "o que mais atrasa as entregas?" ou para comparar períodos.',
+      'Use para "onde a fila trava?", "o que mais atrasa as entregas?" ou para comparar períodos. ' +
+      'Com por_semana, devolve também a evolução semana a semana (gargalo, tempo por etapa e da venda até a entrega), ' +
+      'para "está melhorando?" ou "o gargalo mudou?" numa chamada só.',
     inputSchema: {
       type: 'object',
       properties: {
         dias: { type: 'integer', minimum: 1, maximum: 365, default: 30, description: 'Janela analisada em dias (padrão 30).' },
         horas: HORAS_IN,
+        por_semana: {
+          type: 'boolean',
+          default: false,
+          description: 'Inclui "semanas": o período quebrado em blocos de 7 dias terminando agora, do mais antigo ao mais recente.',
+        },
       },
       additionalProperties: false,
     },
@@ -150,10 +157,23 @@ export const TOOLS: ToolDefinition[] = [
         etapas: arr(
           obj({ etapa: str, passagens: int, mediana_horas: num, p90_horas: num, horas_totais: int, participacao_pct: int }),
         ),
+        semanas: arr(
+          obj({
+            inicio: str,
+            fim: str,
+            passagens: int,
+            gargalo: nullable(str),
+            venda_ate_entrega: obj({ maquinas: int, mediana_horas: num, p90_horas: num }),
+            etapas: arr(obj({ etapa: str, passagens: int, mediana_horas: num, horas_totais: int })),
+          }),
+        ),
       },
-      ['horario_util'],
+      ['horario_util', 'semanas'],
     ),
-    run: (args, ctx) => withDb(ctx.source, (db) => tempoPorEtapa(db, ctx.clock(), { dias: args.dias as number, horas: args.horas as Horas })),
+    run: (args, ctx) =>
+      withDb(ctx.source, (db) =>
+        tempoPorEtapa(db, ctx.clock(), { dias: args.dias as number, horas: args.horas as Horas, por_semana: args.por_semana as boolean }),
+      ),
   },
   {
     name: 'tempo_entre_etapas',
@@ -371,6 +391,10 @@ export function validateArgs(schema: JsonSchema, raw: unknown): Record<string, u
       if (spec.type === 'integer' && !Number.isInteger(value)) throw new ArgumentError(`${key} deve ser um número inteiro.`);
       if (typeof spec.minimum === 'number' && value < spec.minimum) throw new ArgumentError(`${key} deve ser no mínimo ${spec.minimum}.`);
       if (typeof spec.maximum === 'number' && value > spec.maximum) throw new ArgumentError(`${key} deve ser no máximo ${spec.maximum}.`);
+    }
+    if (spec.type === 'boolean') {
+      if (value === 'true' || value === 'false') value = value === 'true';
+      if (typeof value !== 'boolean') throw new ArgumentError(`${key} deve ser true ou false.`);
     }
     if (spec.type === 'string') {
       if (typeof value !== 'string') throw new ArgumentError(`${key} deve ser um texto.`);

@@ -35,6 +35,7 @@ interface PgClient {
   connect(): Promise<void>;
   query(text: string, values?: unknown[]): Promise<{ rows: Row[] }>;
   end(): Promise<void>;
+  on?(event: 'error' | 'end', listener: (error?: Error) => void): unknown;
 }
 
 export type PgLoader = () => Promise<{ Client?: new (config: Record<string, unknown>) => PgClient; default?: { Client: new (config: Record<string, unknown>) => PgClient } }>;
@@ -58,6 +59,15 @@ export async function openPostgres(url: string, load: PgLoader = defaultLoader):
     application_name: 'infocaij-mcp',
     options: `-c default_transaction_read_only=on -c statement_timeout=${timeout} -c idle_in_transaction_session_timeout=${timeout}`,
   });
+  // A conexão fica aberta entre chamadas. Se o banco reiniciar ou a rede cair, o pg emite 'error'
+  // (que derrubaria o processo sem um ouvinte) e a próxima chamada abre uma conexão nova.
+  let alive = true;
+  client.on?.('error', () => {
+    alive = false;
+  });
+  client.on?.('end', () => {
+    alive = false;
+  });
   await client.connect();
   await client.query('SET default_transaction_read_only = on');
 
@@ -73,6 +83,10 @@ export async function openPostgres(url: string, load: PgLoader = defaultLoader):
     async get(sql, params = {}) {
       return (await run(sql, params))[0];
     },
-    close: () => client.end(),
+    async close() {
+      alive = false;
+      await client.end();
+    },
+    isAlive: () => alive,
   };
 }
